@@ -688,7 +688,7 @@ void testConfigurationCheck(const std::filesystem::path &fixtures) {
     require(at != std::string::npos, "the config or metadata has no " + std::string(from));
     return json.replace(at, from.size(), to);
   };
-  // Qwen3.8-Flash-Next loads from a GGUF only; its metadata also states the
+  // Qwen3.8-Flash-Next from a GGUF: its metadata also states the
   // hyper-connections, the QSA indexer and the PLE n-gram embedding.
   const std::string flashConfig = text(fixtures / "qwen3.8-flash-next" / "config.json");
   const std::string flashMetadata = text(fixtures / "qwen3.8-flash-next" / "gguf-metadata.json");
@@ -711,8 +711,28 @@ void testConfigurationCheck(const std::filesystem::path &fixtures) {
   rejects([&] { static_cast<void>(check("gguf", "none", flashConfig, flashMetadata, otherReduction)); },
           "draft config dflash_config target_hidden_reduction mismatch: checkpoint none, runtime stream_mean",
           "a draft of another reduction was accepted");
-  rejects([&] { static_cast<void>(check("mlx-affine", "none", flashConfig, std::nullopt, std::nullopt)); },
-          "Qwen3.8-Flash-Next loads from a GGUF only", "Qwen3.8-Flash-Next was accepted from MLX");
+  // An MLX checkpoint of it (mlx-vlm's qwen4_exp) loads too: its config.json
+  // states the hyper-connections, the indexer and the PLE embedding the
+  // kernels compute, and its output gate by its type.
+  const std::string flashMlx = text(fixtures / "qwen3.8-flash-next" / "mlx-config.json");
+  require(check("mlx-affine", "none", flashMlx, std::nullopt, std::nullopt) == "Qwen3.8-Flash-Next" &&
+              check("mlx-affine", "none", flashMlx, std::nullopt, flashDraft) == "Qwen3.8-Flash-Next",
+          "Qwen3.8-Flash-Next's MLX config was not found to be its family");
+  for (const auto &[from, to, error] : std::initializer_list<std::array<std::string_view, 3>>{
+           {R"("hc_count": 4)", R"("hc_count": 2)", "text config hc_count mismatch: safetensors 2, runtime 4"},
+           {R"("indexer_budget": 2048)", R"("indexer_budget": 1024)",
+            "text config indexer_budget mismatch: safetensors 1024, runtime 2048"},
+           {R"("ple_layer_ids": [
+      2
+    ])", R"("ple_layer_ids": [3])", "text config ple_layer_ids mismatch: safetensors 3, runtime 2"},
+           {R"("output_gate_type": "sigmoid")", R"("output_gate_type": "swish")",
+            "text config output_gate_type mismatch: safetensors swish, runtime sigmoid"},
+           {R"("ple_conv_kernel_size": 4,)", R"("ple_conv_kernel_size": 4, "ple_storage": {"manifest": "ple.json"},)",
+            "text config ple_storage names an external PLE table"}}) {
+    rejects([&] { static_cast<void>(check("mlx-affine", "none", replaced(flashMlx, from, to), std::nullopt,
+                                          std::nullopt)); },
+            error, "Qwen3.8-Flash-Next accepted an MLX config the kernels do not compute");
+  }
   for (const auto &[from, to, error] : std::initializer_list<std::array<std::string_view, 3>>{
            {R"("qwen4exp.hyper_connection.count": 4)", R"("qwen4exp.hyper_connection.count": 2)",
             "GGUF metadata does not match the target: hyper_connection.count 2 (expected 4)"},

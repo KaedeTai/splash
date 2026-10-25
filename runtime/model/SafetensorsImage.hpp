@@ -38,11 +38,22 @@ enum class ModuleNames : uint8_t { Mlx, Transformers };
 
 // Whether the images hold the norms as F32, as they hold a checkpoint's of
 // transformers names (their 1 + w, the GDN's gated norm widened), rather than
-// MLX's bf16 norms as stored.
-[[nodiscard]] constexpr bool float32Norms(ModuleNames names) noexcept { return names == ModuleNames::Transformers; }
+// MLX's bf16 norms as stored. A hyper-connected target's (Qwen3.8-Flash-Next)
+// are F32 by either names: MLX stores its RMSNorm weights 1 below the
+// weights the norm multiplies by too (mlx-vlm's Qwen4ExpRMSNorm applies
+// 1 + w), but the GDN's gated norm's, and its hyper-connection kernels read
+// F32 norms (model/Qwen4Exp.cpp readHyper).
+[[nodiscard]] constexpr bool float32Norms(ModuleNames names, const QwenTargetDimensions &geometry) noexcept {
+  return names == ModuleNames::Transformers || geometry.hyperConnected();
+}
 
-// The layers' images, then the head's and the embedding's. The checkpoint
-// outlives them: their rows read its tensors.
+// The layers' images, then the head's and the embedding's, then, for a
+// target with a PLE n-gram embedding (Qwen3.8-Flash-Next), its table's
+// (ple.bin), as a GGUF's (model/GgufImage.hpp): MLX's row shards
+// (ngram_embedding.shards.<s>, mlx-vlm's ShardedEmbedding) back to back as
+// one table of native rows, each row's values scaled by the table's
+// weight_scale, which the writer folds into an affine row's scales and
+// biases. The checkpoint outlives them: their rows read its tensors.
 [[nodiscard]] std::vector<gguf::Image> planImages(const SafetensorsCheckpoint &checkpoint,
                                                   const QwenTargetDimensions &geometry,
                                                   gguf::PlanOptions options = {});
@@ -55,5 +66,18 @@ enum class ModuleNames : uint8_t { Mlx, Transformers };
 // unquantized (model/ModelDescriptor.mm). The router, the shared-expert gate,
 // GDN alpha and beta and the token table are not among them.
 [[nodiscard]] std::vector<std::string> quantizedModules(const QwenTargetDimensions &geometry, ModuleNames names);
+
+// The MLX names of the PLE n-gram embedding of a target that has one
+// (QwenTargetDimensions::hasPle): the module under which its hash's tensors
+// (layer_multipliers, ngram_heads_offsets, ngram_heads_vocab_sizes) and its
+// table (ngram_embedding) are, and the table's row shards' modules, which
+// the checkpoint holds from shards.0 on, and their rows.
+[[nodiscard]] std::string pleEmbeddingModule(const QwenTargetDimensions &geometry, ModuleNames names);
+struct PleShard final {
+  std::string module;
+  uint64_t rows = 0;
+};
+[[nodiscard]] std::vector<PleShard> pleShards(const SafetensorsCheckpoint &checkpoint,
+                                              const QwenTargetDimensions &geometry, ModuleNames names);
 
 } // namespace splash::model::safetensors

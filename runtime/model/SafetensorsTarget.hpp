@@ -30,6 +30,13 @@ public:
   [[nodiscard]] WeightFile layer(uint32_t index);
   [[nodiscard]] WeightFile head();
   [[nodiscard]] WeightFile embedding();
+  // The image of the table a family's checkpoint holds beside its layers
+  // (safetensors::planImages: Qwen3.8-Flash-Next's PLE n-gram table), which
+  // loads with the weights; refused for a target without one.
+  [[nodiscard]] WeightFile table();
+  // The checkpoint, for what a family reads beside its images (Flash-Next's
+  // PLE hash).
+  [[nodiscard]] const SafetensorsCheckpoint &checkpoint() const noexcept { return planned_->checkpoint; }
   // Whether its images hold F32 norms (safetensors::float32Norms).
   [[nodiscard]] bool float32Norms() const noexcept { return float32Norms_; }
   // Whether the routed experts stream, then the store's options and every
@@ -43,7 +50,8 @@ private:
   struct Planned {
     explicit Planned(const std::filesystem::path &directory) : checkpoint(directory) {}
     SafetensorsCheckpoint checkpoint;
-    std::vector<gguf::Image> images; // layers, head, embedding
+    std::vector<gguf::Image> images; // layers, head, embedding, a family's table
+    uint32_t layers = 0;
   };
   [[nodiscard]] WeightFile open(size_t index);
 

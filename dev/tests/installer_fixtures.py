@@ -22,7 +22,8 @@ from install import families, gguf, hub, models
 DENSE = families.named("Qwen3.8-27B")
 MOE = families.named("Qwen3.6-35B-A3B")
 FLASH_NEXT = families.named("Qwen3.8-Flash-Next")
-# The families whose targets the engine loads from a GGUF only.
+# The families whose fixture config.json is the one the installer derives
+# from a GGUF (the engine loads their MLX checkpoints too).
 GGUF_ONLY = (FLASH_NEXT,)
 MODEL = "mlx-community/Qwen3.8-27B-4bit"
 # An MLX config.json (of a GGUF_ONLY family, the one the installer derives

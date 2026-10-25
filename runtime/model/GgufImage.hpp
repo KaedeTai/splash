@@ -49,6 +49,12 @@ struct RowOrder {
 struct SafetensorsSource {
   const SourceTensor *codes = nullptr, *scales = nullptr, *biases = nullptr;
   const SourceTensor *bfloat16 = nullptr;
+  // The native groups of an affine tensor's group: 2 for groups of 128 held
+  // as native rows of groups of 64 (each half of a group with its scale and
+  // bias, the same values), whose planes tile rows of any whole number of 64
+  // columns where groups of 128 tile whole 256 (Qwen3.8-Flash-Next's experts'
+  // down projections, of 640 columns).
+  uint32_t groupSplit = 1;
 };
 // Whether a quantized safetensors tensor may be in a format: MLX affine,
 // mxfp4, nvfp4 or fp8.

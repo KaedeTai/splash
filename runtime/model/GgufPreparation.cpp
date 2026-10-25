@@ -14,6 +14,7 @@
 #include <functional>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace splash::model {
@@ -85,9 +86,17 @@ std::vector<float> tensorScales(const gguf::TensorRows &rows, uint64_t start, ui
   return result;
 }
 
+// The BF16 nearest a finite value, ties to even.
+uint16_t nearestBfloat16(float value) {
+  const uint32_t bits = std::bit_cast<uint32_t>(value);
+  return static_cast<uint16_t>((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16);
+}
+
 // Native bytes [column, column + span) of `count` source rows of a quantized
 // safetensors tensor from source row `start` on, back to back, read from its
-// tensors: per native block an affine tensor's scale, bias and codes; an
+// tensors: per native block an affine tensor's scale, bias and codes (both
+// times the row's tensor scale g, rounded to the nearest bf16, when it has
+// one: Qwen3.8-Flash-Next's PLE table's weight_scale); an
 // mxfp4 tensor's block_mxfp4, its exponent and its codes with element j in
 // the low nibble of byte j % 16 when j < 16, else in its high nibble (MLX
 // packs element j at bits 4 j of the row); an nvfp4 tensor's 16 E4M3 scales,
@@ -108,21 +117,42 @@ void readSafetensorsRows(const gguf::TensorRows &rows, uint64_t start, uint64_t 
     throw GgufError("quantized safetensors rows are read by whole blocks: " + rows.name);
   // One read of each tensor per run of rows when they are read whole, else per row.
   const uint64_t perRead = span == rows.rowBytes ? count : 1, spanBlocks = span / block;
-  std::vector<uint8_t> codeBytes(perRead * spanBlocks * codes), scales(perRead * spanBlocks * scaleBytes),
-      biases(affine ? perRead * spanBlocks * 2 : 0);
+  // An affine group of `split` native blocks gives each its scale and bias
+  // (gguf::SafetensorsSource::groupSplit); the codes are those of the blocks.
+  const uint64_t split = affine ? rows.safetensors.groupSplit : 1;
+  if (!split || (split > 1 && groups % split))
+    throw GgufError("invalid affine group split of " + rows.name);
+  std::vector<uint8_t> codeBytes(perRead * spanBlocks * codes), scales, biases;
   const std::vector<float> g = tensorScales(rows, start, count);
   for (uint64_t row = 0; row < count; row += perRead) {
-    const uint64_t at = (start + row) * groups + column / block;
+    const uint64_t at = (start + row) * groups + column / block, blocks = perRead * spanBlocks;
+    const uint64_t firstGroup = at / split, groupCount = (at + blocks - 1) / split - firstGroup + 1;
     rows.safetensors.codes->read(at * codes, codeBytes);
-    if (scaleBytes) rows.safetensors.scales->read(at * scaleBytes, scales);
-    if (affine) rows.safetensors.biases->read(at * 2, biases);
-    for (uint64_t b = 0; b < perRead * spanBlocks; ++b) {
+    scales.resize(groupCount * scaleBytes);
+    if (scaleBytes) rows.safetensors.scales->read(firstGroup * scaleBytes, scales);
+    if (affine) {
+      biases.resize(groupCount * 2);
+      rows.safetensors.biases->read(firstGroup * 2, biases);
+    }
+    for (uint64_t b = 0; b < blocks; ++b) {
       uint8_t *out = to + row * span + b * block;
       const uint8_t *in = codeBytes.data() + b * codes;
       const float scale = g[row + b / spanBlocks];
       if (affine) {
-        std::memcpy(out, scales.data() + 2 * b, 2);
-        std::memcpy(out + 2, biases.data() + 2 * b, 2);
+        const uint64_t group = (at + b) / split - firstGroup;
+        if (scale == 1.0F) {
+          std::memcpy(out, scales.data() + 2 * group, 2);
+          std::memcpy(out + 2, biases.data() + 2 * group, 2);
+        } else {
+          for (const auto &[from, offset] : {std::pair{scales.data(), 0}, std::pair{biases.data(), 2}}) {
+            uint16_t bits;
+            std::memcpy(&bits, from + 2 * group, 2);
+            const float scaled = widenBfloat16(bits) * scale;
+            if (!std::isfinite(scaled)) throw GgufError("non-finite scaled affine block of " + rows.name);
+            const uint16_t narrowed = nearestBfloat16(scaled);
+            std::memcpy(out + offset, &narrowed, 2);
+          }
+        }
         std::memcpy(out + 4, in, codes);
       } else if (id == GGUF_FMT_NVFP4) {
         std::memcpy(out, scales.data() + QUANT_NVFP4_G * b, QUANT_NVFP4_G);
@@ -138,12 +168,6 @@ void readSafetensorsRows(const gguf::TensorRows &rows, uint64_t start, uint64_t 
       }
     }
   }
-}
-
-// The BF16 nearest a finite value, ties to even.
-uint16_t nearestBfloat16(float value) {
-  const uint32_t bits = std::bit_cast<uint32_t>(value);
-  return static_cast<uint16_t>((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16);
 }
 
 // A group of 64 BF16 weights as MLX's affine quantization rounds it to 4 bits

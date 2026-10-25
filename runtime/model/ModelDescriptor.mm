@@ -254,6 +254,36 @@ std::optional<SizeDifference> sizeDifference(NSDictionary *text, const QwenHybri
   return std::nullopt;
 }
 
+// What Qwen3.8-Flash-Next's MLX config.json states beside the Qwen3.5
+// hybrid's (mlx-vlm's qwen4_exp TextConfig): the hyper-connections, the QSA
+// indexer of one key head, whose budget is its top blocks' tokens, and the
+// PLE n-gram embedding, its one layer (ple_layer_ids counts from 1), its
+// table's rows in the checkpoint (ple_storage, an external table, is not
+// read) and the end-of-sequence token its hash cuts n-grams at.
+void validateQwen4ExpTextConfig(NSDictionary *text, const QwenHybridLayout &target, std::string_view name) {
+  requireNumbers(text, name, "text config",
+                 {{"hc_count", target.hyperConnections},
+                  {"hc_lowrank", target.hyperRank},
+                  {"indexer_n_heads", target.indexerHeads},
+                  {"indexer_kv_heads", 1},
+                  {"indexer_head_dim", target.indexerHeadDimension},
+                  {"indexer_compress_ratio", target.indexerBlockTokens},
+                  {"indexer_budget", target.indexerTokens()},
+                  {"ngram_size", target.pleNgram},
+                  {"heads_per_ngram", target.pleHeadsPerNgram},
+                  {"ple_embed_dim", target.pleWidth()},
+                  {"ple_conv_kernel_size", target.pleConvolutionTaps}});
+  NSArray *layers = requireArray(text, @"ple_layer_ids", "text config ple_layer_ids");
+  if (layers.count != 1) throw std::invalid_argument("text config ple_layer_ids must name one layer");
+  requireNumber(layers[0], target.pleLayer + 1.0, name, "text config ple_layer_ids");
+  if (text[@"ple_storage"] && text[@"ple_storage"] != [NSNull null])
+    throw std::invalid_argument("text config ple_storage names an external PLE table; Splash reads the table the "
+                                "checkpoint holds");
+  id eos = text[@"eos_token_id"];
+  if ([eos isKindOfClass:[NSArray class]]) eos = [static_cast<NSArray *>(eos) firstObject];
+  requireNumber(eos, target.stopTokens[0], name, "text config eos_token_id");
+}
+
 // The target's text configuration, of its family (describeSourceModel), whose
 // sizes it holds (sizeDifference). A safetensors target's config.json also
 // holds the rest of what the kernels compute; a GGUF's is what the installer
@@ -281,10 +311,15 @@ void validateTextConfig(NSDictionary *text, const QwenHybridLayout &target, Targ
   else
     requireNumbers(text, name, "text config",
                    {{"intermediate_size", target.intermediateSize}});
-  requireBooleans(text, "text config",
-                  {{"attention_bias", false},
-                   {"attn_output_gate", true},
-                   {"tie_word_embeddings", false}});
+  requireBooleans(text, "text config", {{"attention_bias", false}, {"tie_word_embeddings", false}});
+  // The full attention's output gate, which Qwen3.8-Flash-Next's config
+  // states by its type (output_gate_type) instead.
+  if (target.hyperConnected() && !text[@"attn_output_gate"])
+    requireEqual(requireString(text, @"output_gate_type", "text config output_gate_type"), "sigmoid", name,
+                 "text config output_gate_type");
+  else
+    requireBooleans(text, "text config", {{"attn_output_gate", true}});
+  if (target.hyperConnected()) validateQwen4ExpTextConfig(text, target, name);
   requireEqual(requireString(text, @"hidden_act", "text config hidden_act"),
                "silu", name, "text config hidden_act");
   requireLayerTypes(requireArray(text, @"layer_types", "text config layer_types"),
@@ -706,6 +741,10 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
       throw std::invalid_argument(std::string(layout.family) + " loads from a GGUF only");
     validateTextConfig(text, layout, targetSource);
     if (targetSource == TargetSource::Safetensors) requireQuantization(config, layout);
+    // The token the PLE hash reads at an image's positions (Qwen4ExpLayout::pleImageToken).
+    if constexpr (requires { layout.pleImageToken; })
+      if (targetSource == TargetSource::Safetensors && config[@"image_token_id"])
+        requireNumber(config[@"image_token_id"], layout.pleImageToken, sourceName(targetSource), "image_token_id");
     if (targetSource == TargetSource::Gguf && layout.ffnKind == QwenFfnKind::SparseMoe)
       layout.experts = ggufRoutedExperts(text, layout);
     if (draft) dflashLayout = readDraftLayout(draft, layout);

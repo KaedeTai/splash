@@ -10,11 +10,12 @@ SafetensorsTargetLoader::SafetensorsTargetLoader(metal::MetalBackend &backend, W
     : backend_(backend), images_(images), planned_(std::make_shared<Planned>(directory)), experts_(experts) {
   planned_->images =
       safetensors::planImages(planned_->checkpoint, geometry, {.streamExperts = experts.memoryBytes != 0});
-  float32Norms_ = safetensors::float32Norms(safetensors::moduleNames(planned_->checkpoint));
+  planned_->layers = geometry.layers;
+  float32Norms_ = safetensors::float32Norms(safetensors::moduleNames(planned_->checkpoint), geometry);
 }
 
 StreamedBlocks SafetensorsTargetLoader::streamedExperts() const {
-  return {gguf::streamedExperts(std::span(planned_->images).first(planned_->images.size() - 2)), planned_,
+  return {gguf::streamedExperts(std::span(planned_->images).first(planned_->layers)), planned_,
           {[planned = planned_] { planned->checkpoint.checkUnchanged(); }}};
 }
 
@@ -30,12 +31,17 @@ WeightFile SafetensorsTargetLoader::open(size_t index) {
 }
 
 WeightFile SafetensorsTargetLoader::layer(uint32_t index) {
-  if (index >= planned_->images.size() - 2) throw WeightStoreError("target layer is out of range");
+  if (index >= planned_->layers) throw WeightStoreError("target layer is out of range");
   return open(index);
 }
 
-WeightFile SafetensorsTargetLoader::head() { return open(planned_->images.size() - 2); }
+WeightFile SafetensorsTargetLoader::head() { return open(planned_->layers); }
 
-WeightFile SafetensorsTargetLoader::embedding() { return open(planned_->images.size() - 1); }
+WeightFile SafetensorsTargetLoader::embedding() { return open(planned_->layers + 1); }
+
+WeightFile SafetensorsTargetLoader::table() {
+  if (planned_->images.size() <= planned_->layers + 2) throw WeightStoreError("the target holds no table");
+  return open(planned_->layers + 2);
+}
 
 } // namespace splash::model
