@@ -72,6 +72,7 @@ Qwen4ExpTarget::Qwen4ExpTarget(const Qwen4ExpWeights &weights, const QwenTargetG
     : QwenTarget(weights, geometry, backend, operators), weights_(weights),
       steps_(weights, geometry_, backend, prefillChunks) {
   requireLayers(std::span<const Qwen4ExpLayerWeights>(weights.layers));
+  if (weights.mtp) mtp_ = makeMtpState(weights, geometry_, backend, decodeStorageLanes(ExecutionLimits::maximumBatchWidth));
 }
 
 QwenTargetScratchBytes Qwen4ExpTarget::allocatedScratchBytes() const noexcept { return steps_.allocatedBytes(); }
@@ -251,6 +252,7 @@ std::vector<ops::AttentionBlocks> Qwen4ExpTarget::addPrefillQsa(PrefillStep &ste
 
 void Qwen4ExpTarget::prepareVerifyLane(uint32_t lane, uint64_t position, const QwenTargetRequest &request) {
   steps_.prepareVerifyLane(lane, position, request);
+  if (mtp_) prepareMtpLane(lane, position, request);
 }
 
 void Qwen4ExpTarget::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
@@ -440,6 +442,17 @@ void includeFamilyProjections(QwenTargetGeometry &geometry, const Qwen4ExpWeight
     }
   }
   hyper(weights.finalHyper);
+  if (weights.mtp) {
+    const Qwen4MtpWeights &mtp = *weights.mtp;
+    geometry.include(mtp.embeddingProjection);
+    geometry.include(mtp.hiddenProjection);
+    hyper(mtp.mixerHyper);
+    hyper(mtp.ffnHyper);
+    hyper(mtp.finalHyper);
+    geometry.include(mtp.attention.inputProjection);
+    geometry.include(mtp.attention.outputProjection);
+    geometry.include(mtp.head);
+  }
 }
 
 std::unique_ptr<QwenTarget> makeQwenTarget(const Qwen4ExpWeights &weights, const QwenTargetGeometry &geometry,

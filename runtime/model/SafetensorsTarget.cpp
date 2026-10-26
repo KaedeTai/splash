@@ -11,6 +11,10 @@ SafetensorsTargetLoader::SafetensorsTargetLoader(metal::MetalBackend &backend, W
   planned_->images =
       safetensors::planImages(planned_->checkpoint, geometry, {.streamExperts = experts.memoryBytes != 0});
   planned_->layers = geometry.layers;
+  size_t next = geometry.layers + 2;
+  if (geometry.hasPle()) planned_->table = next++;
+  if (safetensors::hasMtp(planned_->checkpoint, geometry)) planned_->mtp = next++;
+  if (planned_->images.size() != next) throw WeightStoreError("the target's images do not match its plan");
   float32Norms_ = safetensors::float32Norms(safetensors::moduleNames(planned_->checkpoint), geometry);
 }
 
@@ -40,8 +44,13 @@ WeightFile SafetensorsTargetLoader::head() { return open(planned_->layers); }
 WeightFile SafetensorsTargetLoader::embedding() { return open(planned_->layers + 1); }
 
 WeightFile SafetensorsTargetLoader::table() {
-  if (planned_->images.size() <= planned_->layers + 2) throw WeightStoreError("the target holds no table");
-  return open(planned_->layers + 2);
+  if (!planned_->table) throw WeightStoreError("the target holds no table");
+  return open(planned_->table);
+}
+
+WeightFile SafetensorsTargetLoader::mtp() {
+  if (!planned_->mtp) throw WeightStoreError("the target holds no MTP head");
+  return open(planned_->mtp);
 }
 
 } // namespace splash::model

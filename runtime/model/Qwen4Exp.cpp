@@ -3,6 +3,7 @@
 #include "model/GgufTarget.hpp"
 #include "model/QwenTargetLoader.hpp"
 #include "model/SafetensorsImage.hpp"
+#include "model/ExpertStore.hpp"
 #include "model/SafetensorsTarget.hpp"
 #include "model/SparseRowStore.hpp"
 
@@ -226,6 +227,32 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend, Qwen4ExpLayout
                                                layout.pleHeadDimension, "ple-table");
           file.finish();
           result.files.push_back(file.record());
+        }
+        if constexpr (!fromGguf) {
+          if (source.hasMtp()) {
+            // The image's sections in their order (SafetensorsImage.cpp walkMtp);
+            // its experts are resident whether the target's stream or not.
+            WeightFile file = source.mtp();
+            Qwen4MtpWeights mtp;
+            mtp.embeddingNorm = format.norm(file, layout.hiddenSize, "mtp-embedding-norm");
+            mtp.hiddenNorm = format.norm(file, streams, "mtp-hidden-norm");
+            mtp.embeddingProjection =
+                format.projection(file, layout.hiddenSize, layout.hiddenSize, "mtp-embedding-projection");
+            mtp.hiddenProjection = format.projection(file, layout.hiddenSize, layout.hiddenSize, "mtp-hidden-projection");
+            mtp.mixerHyper = readHyper(file, layout, true, "mtp-mixer-hyper");
+            mtp.attention = std::get<QwenAttentionWeights>(readQwenMixer(file, format, layout, true));
+            mtp.ffnHyper = readHyper(file, layout, true, "mtp-ffn-hyper");
+            MoeExperts resident;
+            resident.resident = residentExpertSlots(backend, layout.experts);
+            resident.experts = layout.experts;
+            mtp.ffn = readMoeBlock(file, resident, layout.layers);
+            mtp.finalHyper = readHyper(file, layout, false, "mtp-final-hyper");
+            mtp.head = format.projection(file, layout.vocabularySize, layout.hiddenSize, "mtp-head");
+            mtp.head.destination = ops::FloatOutput::Float32;
+            file.finish();
+            result.files.push_back(file.record());
+            result.mtp = std::move(mtp);
+          }
         }
         return result;
       });

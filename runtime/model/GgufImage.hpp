@@ -55,6 +55,11 @@ struct SafetensorsSource {
   // columns where groups of 128 tile whole 256 (Qwen3.8-Flash-Next's experts'
   // down projections, of 640 columns).
   uint32_t groupSplit = 1;
+  // The type of the affine tensor (QUANT_AFFINE_TYPE) whose values the
+  // writer quantizes again into native af4g64 rows, as MLX's affine
+  // quantization rounds them; 0 for rows of the tensor's own format (the
+  // MTP head's draft copy of the target's head, model/SafetensorsImage.hpp).
+  uint32_t requantize = 0;
 };
 // Whether a quantized safetensors tensor may be in a format: MLX affine,
 // mxfp4, nvfp4 or fp8.

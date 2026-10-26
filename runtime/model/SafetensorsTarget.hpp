@@ -34,6 +34,10 @@ public:
   // (safetensors::planImages: Qwen3.8-Flash-Next's PLE n-gram table), which
   // loads with the weights; refused for a target without one.
   [[nodiscard]] WeightFile table();
+  // The image of the MTP head the checkpoint embeds (safetensors::hasMtp),
+  // which loads with the weights; refused for a target without one.
+  [[nodiscard]] bool hasMtp() const noexcept { return planned_->mtp != 0; }
+  [[nodiscard]] WeightFile mtp();
   // The checkpoint, for what a family reads beside its images (Flash-Next's
   // PLE hash).
   [[nodiscard]] const SafetensorsCheckpoint &checkpoint() const noexcept { return planned_->checkpoint; }
@@ -52,6 +56,8 @@ private:
     SafetensorsCheckpoint checkpoint;
     std::vector<gguf::Image> images; // layers, head, embedding, a family's table
     uint32_t layers = 0;
+    // The index of the table's and the MTP head's images, 0 for none.
+    size_t table = 0, mtp = 0;
   };
   [[nodiscard]] WeightFile open(size_t index);
 

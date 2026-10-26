@@ -28,6 +28,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <list>
@@ -327,6 +329,18 @@ struct Runtime::Impl {
     // the prompt (with any replayed generation) and the emitted output, which
     // the target may read (QwenTargetRequest).
     std::vector<uint32_t> tokens;
+    // The target's MTP head (QwenTarget::hasMtp): the state lane whose ring
+    // and last streams are the request's, the first position of the ring
+    // its attention reads, whether the lane keeps its last streams; and the
+    // draft its cycles take (wantsMtp): its cycles, and each draft's
+    // retained tokens a cycle, averaged, and cycles (DFlash2's, the MTP
+    // head's).
+    uint32_t mtpLane = UINT32_MAX;
+    uint64_t mtpValidFrom = 0;
+    bool mtpLast = false;
+    uint64_t draftCycles = 0;
+    std::array<double, 2> draftTokens{};
+    std::array<uint32_t, 2> draftSamples{};
   };
 
   struct DecodeLaneResult final {
@@ -360,6 +374,50 @@ struct Runtime::Impl {
     MetalBuffer pages;
     MetalBuffer index;
   };
+
+  // The draft a cycle takes where the target has an MTP head (SPLASH_DRAFT):
+  // auto, whichever of DFlash2 and the head a request's cycles yield more
+  // tokens a millisecond with (wantsMtp); dflash or mtp, that draft alone.
+  // The head drafts SPLASH_MTP_STEPS proposals (2 by default: on an M5 Max
+  // Flash-Next's 3-bit MLX pack decoded Chinese prose fastest so, 76 tok/s
+  // against DFlash2's 64; a step costs about as much as the target verifying
+  // one more row).
+  enum class DraftChoice : uint8_t { Auto, DFlash, Mtp };
+  static DraftChoice draftChoiceFromEnvironment() noexcept {
+    const char *value = std::getenv("SPLASH_DRAFT");
+    if (!value) return DraftChoice::Auto;
+    const std::string_view choice(value);
+    return choice == "mtp" ? DraftChoice::Mtp : choice == "dflash" ? DraftChoice::DFlash : DraftChoice::Auto;
+  }
+  static uint32_t mtpStepsFromEnvironment() noexcept {
+    const char *value = std::getenv("SPLASH_MTP_STEPS");
+    const long steps = value ? std::strtol(value, nullptr, 10) : 2;
+    return static_cast<uint32_t>(std::clamp<long>(steps, 1, kDraftProposalTokens));
+  }
+  DraftChoice draftChoice = draftChoiceFromEnvironment();
+  uint32_t mtpSteps = mtpStepsFromEnvironment();
+  // With SPLASH_DRAFT_FILE, the choice and steps a file names ("auto 3",
+  // "mtp 4", "dflash"), read again every 16th cycle: for measurements that
+  // compare them on one server.
+  uint64_t draftFileCycles = 0;
+  void readDraftFile() {
+    const char *path = std::getenv("SPLASH_DRAFT_FILE");
+    if (!path || draftFileCycles++ % 16) return;
+    std::FILE *file = std::fopen(path, "r");
+    if (!file) return;
+    char choice[16] = {};
+    unsigned steps = mtpSteps;
+    if (std::fscanf(file, "%15s %u", choice, &steps) >= 1) {
+      const std::string_view name(choice);
+      draftChoice = name == "mtp" ? DraftChoice::Mtp : name == "dflash" ? DraftChoice::DFlash : DraftChoice::Auto;
+      mtpSteps = std::clamp<uint32_t>(steps, 1, kDraftProposalTokens);
+    }
+    std::fclose(file);
+  }
+  // The request whose ring each state lane holds.
+  std::unordered_map<uint32_t, uint64_t> mtpOwners;
+  // Each draft's wall milliseconds a cycle of each lane count, averaged.
+  std::array<std::array<double, 2>, kLaneCount + 1> draftMilliseconds{};
 
   MetalBackend &backend;
   const LoadedModel &model;
@@ -1941,7 +1999,7 @@ struct Runtime::Impl {
     buffers.gateScratch = decodeArena->gateScratch();
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
     draftModel.addDecode(graph, std::move(buffers),
-                         targetModel->vocabularyProjection(),
+                         targetModel->draftVocabularyProjection(),
                          std::span(cacheLengths).first(lanes));
     std::array<uint32_t, kLaneCount> anchors{};
     std::array<ops::SamplingPolicy, kLaneCount> policies{};
@@ -1969,6 +2027,101 @@ struct Runtime::Impl {
                                       verify, maximumRows);
     sampling.addThinkingDrafts(graph, std::span(policies).first(lanes),
                                d(DecodeTensor::ProposedTokens));
+  }
+
+  // The request's MTP lane at its anchor's position: its state lane, taken
+  // over with a ring from the position on when another request held it or
+  // the request held another.
+  QwenMtpLane mtpLane(Request &entry, uint64_t position) {
+    const auto owner = mtpOwners.find(entry.stateLane);
+    if (entry.mtpLane != entry.stateLane || owner == mtpOwners.end() || owner->second != entry.id) {
+      entry.mtpLane = entry.stateLane;
+      entry.mtpLast = false;
+      entry.mtpValidFrom = position;
+      mtpOwners[entry.stateLane] = entry.id;
+    }
+    return {entry.stateLane, static_cast<uint32_t>(position), static_cast<uint32_t>(entry.mtpValidFrom),
+            entry.mtpLast};
+  }
+
+  // Whether the request's next cycle of `lanes` lanes drafts with the MTP
+  // head: a greedy, unconstrained request whose lane keeps its last
+  // streams, by draftChoice. Under auto it first takes DFlash2 four cycles
+  // and the head four, then the draft of more tokens a millisecond, and
+  // every 64th cycle and the next the other.
+  bool wantsMtp(Request &entry, uint64_t position, uint32_t lanes) {
+    if (!targetModel->hasMtp() || draftChoice == DraftChoice::DFlash) return false;
+    if (samplingPolicy(entry).samples() || entry.constraint != ConstraintMode::None) return false;
+    if (!mtpLane(entry, position).hasLast) return false;
+    if (draftChoice == DraftChoice::Mtp) return true;
+    if (entry.draftSamples[0] < 4) return false;
+    if (entry.draftSamples[1] < 4) return true;
+    const auto rate = [&](uint32_t draft) {
+      const double ms = draftMilliseconds[lanes][draft];
+      return ms > 0 ? entry.draftTokens[draft] / ms : 0.0;
+    };
+    const bool better = rate(1) > rate(0);
+    return entry.draftCycles % 64 < 2 ? !better : better;
+  }
+
+  // The decode buffers the MTP head's steps share with a verify of `lanes`
+  // lanes.
+  QwenTargetVerifyBuffers mtpVerifyBuffers(uint32_t lanes) const {
+    const uint32_t storage = targetModel->decodeStorageLanes(lanes);
+    auto d = [&](DecodeTensor tensor) { return decodeArena->batchSlice(tensor, storage); };
+    QwenTargetVerifyBuffers buffers;
+    buffers.linearScratch = decodeArena->linearScratch();
+    buffers.normalized = d(DecodeTensor::Normalized);
+    buffers.fullPacked = d(DecodeTensor::FullPacked);
+    buffers.fullQueries = d(DecodeTensor::FullQueries);
+    buffers.fullAttention = d(DecodeTensor::FullAttention);
+    buffers.attentionHidden = d(DecodeTensor::AttentionHidden);
+    buffers.ropeInverseFrequencies = prefillArena->get(PrefillTensor::TargetInverseFrequencies);
+    buffers.finalHidden = d(DecodeTensor::FinalHidden);
+    buffers.logits = d(DecodeTensor::Logits);
+    buffers.moe = decodeArena->moeScratch(storage);
+    return buffers;
+  }
+
+  QwenMtpBuffers mtpBuffers(const QwenTargetVerifyBuffers &verify, uint32_t lanes) const {
+    return {&verify, decodeArena->batchSlice(DecodeTensor::DraftInputTokens, lanes),
+            decodeArena->batchSlice(DecodeTensor::ProposedTokens, lanes),
+            decodeArena->batchSlice(DecodeTensor::VerifyConfidence, lanes),
+            decodeArena->batchSlice(DecodeTensor::InputTokens, lanes),
+            decodeArena->batchSlice(DecodeTensor::RetainedCount, lanes)};
+  }
+
+  // The MTP head's proposals for each lane in place of DFlash2's, every one
+  // of which the lane verifies, up to maximumRows[lane].
+  void encodeMtpDraftBatch(CommandGraph &graph, std::span<Request *const> entries,
+                           std::span<const uint64_t> logicalPositions, std::span<const uint32_t> maximumRows) {
+    const uint32_t lanes = static_cast<uint32_t>(entries.size());
+    std::array<QwenMtpLane, kLaneCount> mtp{};
+    std::array<uint32_t, kLaneCount> verified{};
+    std::array<ops::SamplingPolicy, kLaneCount> policies{};
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      mtp[lane] = mtpLane(*entries[lane], logicalPositions[lane]);
+      verified[lane] = std::min(maximumRows[lane], mtpSteps + 1);
+      policies[lane] = samplingPolicy(*entries[lane]);
+    }
+    const QwenTargetVerifyBuffers verify = mtpVerifyBuffers(lanes);
+    targetModel->addMtpDraft(graph, mtpBuffers(verify, lanes), std::span(mtp).first(lanes), mtpSteps);
+    ops::DraftSelector::addVerifyRows(graph, decodeArena->batchSlice(DecodeTensor::VerifyConfidence, lanes),
+                                      decodeArena->batchSlice(DecodeTensor::VerifyRows, lanes), {},
+                                      std::span(verified).first(lanes));
+    sampling.addThinkingDrafts(graph, std::span(policies).first(lanes),
+                               decodeArena->batchSlice(DecodeTensor::ProposedTokens, lanes));
+  }
+
+  // After a verify's commit: the MTP head's ring entries of its rows and
+  // each lane's last streams.
+  void encodeMtpCatchUp(CommandGraph &graph, std::span<Request *const> entries,
+                        std::span<const ModelBatchItem> items) {
+    const uint32_t lanes = static_cast<uint32_t>(entries.size());
+    std::array<QwenMtpLane, kLaneCount> mtp{};
+    for (uint32_t lane = 0; lane < lanes; ++lane) mtp[lane] = mtpLane(*entries[lane], items[lane].logicalPosition);
+    const QwenTargetVerifyBuffers verify = mtpVerifyBuffers(lanes);
+    targetModel->addMtpCatchUp(graph, mtpBuffers(verify, lanes), std::span(mtp).first(lanes));
   }
 
   void encodeTargetVerifyBatchForward(CommandGraph &graph,
@@ -2196,7 +2349,8 @@ struct Runtime::Impl {
   // masks, whose costs the verify budget fits apart.
   std::vector<ModelStepResult> finalizeDecode(
       std::span<DecodeLaneResult> lanes, std::span<const ModelBatchItem> items,
-      CommandTiming timing, SpilledKvReads &reads, bool constrained) {
+      CommandTiming timing, SpilledKvReads &reads, bool constrained, bool mtpDraft = false,
+      bool mtpCatchUp = false) {
     reads.end();
     std::array<std::vector<uint64_t>, kLaneCount> unreadable = unreadableBlocks(reads);
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
@@ -2230,7 +2384,9 @@ struct Runtime::Impl {
     bool commits = true;
     for (uint32_t lane = 0; lane < items.size(); ++lane)
       commits = commits && lanes[lane].failure.empty() && unreadable[lane].empty();
-    if (verifyBudget && commits) {
+    // The MTP head's confidences are not the DFlash2 selector's, whose
+    // acceptance the budget models.
+    if (verifyBudget && commits && !mtpDraft) {
       std::array<VerifyBudget::Lane, kLaneCount> observed{};
       for (uint32_t lane = 0; lane < items.size(); ++lane) {
         const float *confidence = contents<float>(
@@ -2287,6 +2443,26 @@ struct Runtime::Impl {
                               nextLength, false, false));
       entry.generatedTokens += laneResult.retained;
       commitSelected(entry, {targetTokens, laneResult.retained});
+      // The MTP head's ring and last streams follow the lane's verify when
+      // its catch-up ran, and the draft's averages its cycle.
+      if (mtpCatchUp) {
+        entry.mtpLast = true;
+      } else {
+        entry.mtpLane = UINT32_MAX;
+        entry.mtpLast = false;
+      }
+      {
+        const uint32_t draft = mtpDraft ? 1 : 0;
+        constexpr double kWeight = 0.2;
+        const double tokens = laneResult.retained;
+        entry.draftTokens[draft] =
+            entry.draftSamples[draft] ? entry.draftTokens[draft] + kWeight * (tokens - entry.draftTokens[draft]) : tokens;
+        ++entry.draftSamples[draft];
+        ++entry.draftCycles;
+        double &ms = draftMilliseconds[std::min<size_t>(items.size(), kLaneCount)][draft];
+        const double wall = timing.wallSeconds * 1000.0;
+        ms = ms > 0 ? ms + kWeight * (wall - ms) : wall;
+      }
       entry.maskWords.clear();
       entry.verifyMaskInFlight = false;
       // The end replaced the first proposals, which acceptance keeps as far
@@ -3023,13 +3199,23 @@ Runtime::decodeAsync(const BatchPlan &plan,
       impl_->decodeArena->batchSlice(DecodeTensor::RopeSin, width),
       impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeCos, width),
       impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeSin, width));
-  impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
-                              DecodeTensor::DraftHidden0, width);
-  impl_->draftModel.addMaskRows(commandGraph, impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width),
-                                width);
-  impl_->encodeDraftBatchGraph(commandGraph, entries,
-                               {logicalPositions.data(), width},
-                               {maximumRetained.data(), width}, constrained);
+  // The MTP head drafts the cycle when every lane wants it (wantsMtp).
+  impl_->readDraftFile();
+  bool mtpDraft = !constrained && impl_->targetModel->hasMtp();
+  for (uint32_t lane = 0; mtpDraft && lane < width; ++lane)
+    mtpDraft = impl_->wantsMtp(*requests[lane], logicalPositions[lane], width);
+  if (mtpDraft) {
+    impl_->encodeMtpDraftBatch(commandGraph, entries, {logicalPositions.data(), width},
+                               {maximumRetained.data(), width});
+  } else {
+    impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
+                                DecodeTensor::DraftHidden0, width);
+    impl_->draftModel.addMaskRows(commandGraph, impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width),
+                                  width);
+    impl_->encodeDraftBatchGraph(commandGraph, entries,
+                                 {logicalPositions.data(), width},
+                                 {maximumRetained.data(), width}, constrained);
+  }
   std::shared_ptr<SpilledKvReads> reads = impl_->decodeReads(items);
   if (constrained) {
     return std::make_unique<Impl::ConstrainedDecodeTicket>(
@@ -3040,12 +3226,14 @@ Runtime::decodeAsync(const BatchPlan &plan,
                               DecodeTensor::Hidden0, width);
   impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items, *reads);
   impl_->encodeVerifyCommit(commandGraph, entries, items, {maximumRetained.data(), width});
+  const bool mtpCatchUp = impl_->targetModel->hasMtp();
+  if (mtpCatchUp) impl_->encodeMtpCatchUp(commandGraph, entries, items);
 
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
   Impl *impl = impl_.get();
   auto finish = [impl, lanes = std::move(lanes), reads = std::move(reads),
-                 items = std::move(copiedItems)](CommandTiming timing) mutable {
-    return impl->finalizeDecode(lanes, items, timing, *reads, false);
+                 items = std::move(copiedItems), mtpDraft, mtpCatchUp](CommandTiming timing) mutable {
+    return impl->finalizeDecode(lanes, items, timing, *reads, false, mtpDraft, mtpCatchUp);
   };
   CommandTicket command = impl_->backend.submitCommandAsync(
       commandGraph.command(), std::move(completion));

@@ -67,6 +67,12 @@ enum class ModuleNames : uint8_t { Mlx, Transformers };
 // GDN alpha and beta and the token table are not among them.
 [[nodiscard]] std::vector<std::string> quantizedModules(const QwenTargetDimensions &geometry, ModuleNames names);
 
+// Whether the images end with the image of the MTP head an MLX checkpoint
+// of a hyper-connected MoE target embeds (mtp.*, Qwen3.8-Flash-Next's),
+// after the table's: unless SPLASH_MTP=0 leaves it out (mtpDisabled).
+[[nodiscard]] bool hasMtp(const SafetensorsCheckpoint &checkpoint, const QwenTargetDimensions &geometry);
+[[nodiscard]] bool mtpDisabled();
+
 // The MLX names of the PLE n-gram embedding of a target that has one
 // (QwenTargetDimensions::hasPle): the module under which its hash's tensors
 // (layer_multipliers, ngram_heads_offsets, ngram_heads_vocab_sizes) and its

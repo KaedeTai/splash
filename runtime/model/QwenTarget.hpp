@@ -341,6 +341,34 @@ struct QwenTargetVerifyBuffers final {
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> auxiliary;
 };
 
+// A lane of an MTP head's step (QwenTarget::addMtpDraft, addMtpCatchUp): its
+// state lane, which keeps its head's ring and last streams, the position of
+// its anchor, the first position of its ring its attention reads, and
+// whether its last committed streams are kept (the catch-up's row 0, the
+// position before the anchor, reads them).
+struct QwenMtpLane final {
+  uint32_t stateLane = 0;
+  uint32_t position = 0;
+  uint32_t validFrom = 0;
+  bool hasLast = false;
+};
+
+// The decode buffers an MTP head's steps read and write beside a verify's,
+// whose scratch they share: each lane's draft input rows (its anchor in row
+// 0), its proposals and their confidences (as the DFlash2 selector writes
+// them), the verify's input tokens and the rows each lane retained.
+struct QwenTargetVerifyBuffers;
+struct QwenMtpBuffers;
+
+struct QwenMtpBuffers final {
+  const QwenTargetVerifyBuffers *verify = nullptr;
+  metal::MetalBuffer draftInputTokens;
+  metal::MetalBuffer proposedTokens;
+  metal::MetalBuffer confidence;
+  metal::MetalBuffer verifyInputTokens;
+  metal::MetalBuffer retainedCounts;
+};
+
 // The auxiliary state after the rows each lane of a verify retained, which
 // its commit writes from the state before the step (addStateCommit). The GDN
 // state folds the rows into the lane's next step instead (ops::GdnTapeLane).
@@ -415,6 +443,11 @@ public:
 
   [[nodiscard]] const ops::Projection &
   vocabularyProjection() const noexcept;
+  // The head a draft reads its logits through: the vocabulary projection,
+  // or a copy of it in fewer bits (Qwen3.8-Flash-Next's with an MTP head).
+  [[nodiscard]] virtual const ops::Projection &draftVocabularyProjection() const noexcept {
+    return vocabularyProjection();
+  }
   // Lanes of storage the tensors of a decode step of `lanes` lanes bind: a
   // linear tile may hold more rows than the step (LinearPlan::storageRows;
   // a three-lane GGUF step on the staged tile runs its 32-row tile over four
@@ -483,6 +516,21 @@ public:
   // each row's in order, for tests (RuntimeInstrumentation::lastTableRows);
   // none for a target that reads no table.
   [[nodiscard]] virtual std::vector<uint32_t> verifyTableRows(uint32_t lane) const;
+  // The MTP head a target embeds (Qwen3.8-Flash-Next from an MLX checkpoint
+  // that holds one, model/Qwen4Mtp.cpp); none for any other.
+  [[nodiscard]] virtual bool hasMtp() const noexcept { return false; }
+  // Before a verify: `steps` (1 to SPLASH_DRAFT_PROPOSAL_TOKENS) proposals of
+  // each lane drafted by the head, one at a time, into the proposals and
+  // their confidences, the rest of each lane's zero. Every lane's last
+  // streams are kept.
+  virtual void addMtpDraft(metal::CommandGraph &graph, const QwenMtpBuffers &buffers,
+                           std::span<const QwenMtpLane> lanes, uint32_t steps) const;
+  // After a verify's commit: the head's keys and values of the positions
+  // from the one before each lane's anchor on, from the verify's streams and
+  // tokens, into the lane's ring, and the streams of its last retained row,
+  // which the lane keeps.
+  virtual void addMtpCatchUp(metal::CommandGraph &graph, const QwenMtpBuffers &buffers,
+                             std::span<const QwenMtpLane> lanes) const;
 
 protected:
   QwenTarget(const QwenTargetWeightsBase &weights, const QwenTargetGeometry &geometry, metal::MetalBackend &backend,

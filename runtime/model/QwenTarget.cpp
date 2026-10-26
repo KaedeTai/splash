@@ -119,6 +119,15 @@ void QwenTarget::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer d
                                  geometry_.vocabularySize, lanes);
 }
 
+void QwenTarget::addMtpDraft(metal::CommandGraph &, const QwenMtpBuffers &, std::span<const QwenMtpLane>,
+                             uint32_t) const {
+  throw std::logic_error("the target has no MTP head");
+}
+
+void QwenTarget::addMtpCatchUp(metal::CommandGraph &, const QwenMtpBuffers &, std::span<const QwenMtpLane>) const {
+  throw std::logic_error("the target has no MTP head");
+}
+
 void QwenTarget::addEmbedding(metal::CommandGraph &graph,
                               metal::MetalBuffer tokens,
                               metal::MetalBuffer hidden,

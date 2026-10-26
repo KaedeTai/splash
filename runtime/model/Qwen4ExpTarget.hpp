@@ -12,6 +12,8 @@
 #include "model/QwenTarget.hpp"
 
 #include <cstdint>
+#include <map>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -52,6 +54,13 @@ public:
   // The PLE rows of batch lane `lane`'s verify rows of the last step, each
   // row's heads' in order.
   [[nodiscard]] std::vector<uint32_t> verifyTableRows(uint32_t lane) const override;
+  // Its embedded MTP head (model/Qwen4Mtp.cpp), when the weights hold one.
+  [[nodiscard]] bool hasMtp() const noexcept override;
+  [[nodiscard]] const ops::Projection &draftVocabularyProjection() const noexcept override;
+  void addMtpDraft(metal::CommandGraph &graph, const QwenMtpBuffers &buffers, std::span<const QwenMtpLane> lanes,
+                   uint32_t steps) const override;
+  void addMtpCatchUp(metal::CommandGraph &graph, const QwenMtpBuffers &buffers,
+                     std::span<const QwenMtpLane> lanes) const override;
 
 private:
   // The shared prefill's layer loop runs the family's (QwenTarget::addPrefillLayers).
@@ -105,9 +114,37 @@ private:
   // scratch.pleSlots, with the table's own gather.
   void addPleGather(metal::CommandGraph &graph, const Qwen4Scratch &scratch, uint32_t count) const;
 
+  // The MTP head's steps (model/Qwen4Mtp.cpp): its buffers, each state
+  // lane's ring and last streams, and the rows of a step it runs: from the
+  // tokens `tokens` (lane_rows a lane) and the streams `streamsIn`, the
+  // head's streams into `streams`, the lanes' `rows` rows from their
+  // positions (rope row `ropeRow` on) attending their rings; with `logits`,
+  // the head's logits of the step.
+  struct MtpState;
+  struct MtpRows final {
+    metal::MetalBuffer tokens;
+    metal::MetalBuffer streamsIn;
+    metal::MetalBuffer streams;
+    uint32_t rows = 0;
+    uint32_t ropeRow = 0;
+    bool logits = false;
+  };
+  void addMtpRows(metal::CommandGraph &graph, const QwenMtpBuffers &buffers, std::span<const QwenMtpLane> lanes,
+                  const MtpRows &rows) const;
+  ops::PreparedInput addMtpMix(metal::CommandGraph &graph, const QwenTargetVerifyBuffers &buffers,
+                               const Qwen4Scratch &scratch, metal::MetalBuffer streams, const Qwen4HyperWeights &hyper,
+                               metal::MetalBuffer output, uint32_t lanes, const ops::Projection *next) const;
+  void prepareMtpLane(uint32_t lane, uint64_t position, const QwenTargetRequest &request);
+  void addMtpRopeTables(metal::CommandGraph &graph, const QwenTargetVerifyBuffers &buffers, uint32_t lanes) const;
+
   const Qwen4ExpWeights &weights_;
   // The step scratch and the inputs the target makes of a step's tokens.
   Qwen4Steps steps_;
+  // Shared, so that its type may stay incomplete here.
+  std::shared_ptr<MtpState> mtp_;
+  [[nodiscard]] static std::shared_ptr<MtpState> makeMtpState(const Qwen4ExpWeights &weights,
+                                                              const QwenTargetGeometry &geometry,
+                                                              metal::MetalBackend &backend, uint32_t storageLanes);
 };
 
 } // namespace splash::model

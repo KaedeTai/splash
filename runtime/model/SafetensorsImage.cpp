@@ -6,6 +6,7 @@
 #include "model/WeightStore.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <initializer_list>
 #include <optional>
 #include <string_view>
@@ -73,6 +74,25 @@ public:
   void projection(const std::string &module, uint64_t rows, uint64_t columns) {
     const TensorRows source = requireQuantized(module, rows, columns);
     Repack repack = image_.planes(gguf_format_of(source.type), rows, columns, module);
+    repack.sources.push_back(source);
+    image_.repack(std::move(repack));
+  }
+
+  // A quantized [rows, columns] tensor as the planes of af4g64, its values
+  // quantized again when its format holds more bits (SafetensorsSource::
+  // requantize): the MTP head's draft copy of the target's head, which the
+  // draft reads in about half the bytes of an 8-bit head.
+  void requantizedProjection(const std::string &module, uint64_t rows, uint64_t columns) {
+    TensorRows source = requireQuantized(module, rows, columns);
+    const uint32_t format = gguf_format_of(source.type);
+    const uint32_t bits = (source.type >> 8) & 0xFF;
+    if (!quant_affine_format(format) || bits <= 4) return projection(module, rows, columns);
+    const uint32_t group = (source.type & 0xFF) * source.safetensors.groupSplit;
+    source.safetensors.requantize = QUANT_AFFINE_TYPE(bits, group);
+    source.safetensors.groupSplit = 1;
+    source.type = kQuantFormats[GGUF_FMT_AF4G64].ggml_type;
+    source.rowBytes = ggufRowBytes(kQuantFormats[GGUF_FMT_AF4G64], columns);
+    Repack repack = image_.planes(GGUF_FMT_AF4G64, rows, columns, module + "-draft");
     repack.sources.push_back(source);
     image_.repack(std::move(repack));
   }
@@ -538,9 +558,33 @@ template <class Walk> void walkEmbedding(Walk &b, ModuleNames names) {
   b.embedding(modelPrefix(names) + "embed_tokens");
 }
 
+// Qwen3.8-Flash-Next's embedded MTP head (mlx-vlm's Qwen4ExpMTPModule,
+// under mtp.): its norms of the next token's embedding and of the streams,
+// its projections of both, one hyper-connected full-attention layer with a
+// sparse MoE, as a target layer's image holds one but its QSA indexer, which
+// the head's draft attention does not read, and its last mix, which injects
+// nothing (model/Qwen4Exp.hpp Qwen4MtpWeights).
+template <class Walk> void walkMtp(Walk &b, const QwenTargetDimensions &g) {
+  const std::string mtp = "mtp.";
+  b.norm(mtp + "pre_fc_norm_embedding", g.hiddenSize);
+  b.norm(mtp + "pre_fc_norm_hidden", g.streamWidth());
+  b.projection(mtp + "fc_embedding", g.hiddenSize, g.hiddenSize);
+  b.projection(mtp + "fc_hidden", g.hiddenSize, g.hiddenSize);
+  const std::string layer = mtp + "layers.0.";
+  walkHyper(b, g, layer + "attn_hyper_connection.", true);
+  walkMixer(b, g, layer, g.fullAttentionPeriod - 1);
+  walkHyper(b, g, layer + "mlp_hyper_connection.", true);
+  walkFfn(b, g, layer);
+  walkHyper(b, g, mtp + "hyper_connection_mixer.", false);
+  // The draft's copy of the target's head.
+  b.requantizedProjection(headName(ModuleNames::Mlx), g.vocabularySize, g.hiddenSize);
+}
+
 // The header type of a family's table's image (ple.bin), as a GGUF's
-// (GgufImage.cpp kTableImageType), beside the layers' 0 and 1 and the head's 2.
+// (GgufImage.cpp kTableImageType), beside the layers' 0 and 1 and the head's 2,
+// and of the MTP head's (mtp.bin).
 constexpr uint32_t kTableImageType = 3;
+constexpr uint32_t kMtpImageType = 4;
 
 } // namespace
 
@@ -571,7 +615,23 @@ std::vector<gguf::Image> planImages(const SafetensorsCheckpoint &checkpoint, con
                    geometry.pleHeadDimension);
     images.push_back(table.finish());
   }
+  if (hasMtp(checkpoint, geometry)) {
+    // Its experts load with it whether the target's stream or not.
+    Builder mtp(checkpoint, geometry, names, "mtp.bin", geometry.layers, kMtpImageType);
+    walkMtp(mtp, geometry);
+    images.push_back(mtp.finish());
+  }
   return images;
+}
+
+bool hasMtp(const SafetensorsCheckpoint &checkpoint, const QwenTargetDimensions &geometry) {
+  return geometry.hyperConnected() && geometry.ffnKind == QwenFfnKind::SparseMoe &&
+         checkpoint.find("mtp.fc_embedding.weight") && !mtpDisabled();
+}
+
+bool mtpDisabled() {
+  const char *value = std::getenv("SPLASH_MTP");
+  return value && std::string_view(value) == "0";
 }
 
 std::vector<std::string> quantizedModules(const QwenTargetDimensions &geometry, ModuleNames names) {

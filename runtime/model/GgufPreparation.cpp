@@ -48,8 +48,9 @@ void requireRange(uint64_t offset, uint64_t bytes, uint64_t available) {
 // rows, which it builds from a quantized safetensors tensor's tensors, from
 // a GGUF's NVFP4 rows, or by quantizing a BF16 weight (into af4g64) or a
 // GGUF tensor of BF16 or F16 values (into Q8_0).
-enum class RowReader : uint8_t { Stored, Safetensors, GgufNvfp4, QuantizedBfloat16, QuantizedGgufFloat };
+enum class RowReader : uint8_t { Stored, Safetensors, Requantized, GgufNvfp4, QuantizedBfloat16, QuantizedGgufFloat };
 RowReader rowReader(const gguf::TensorRows &rows) {
+  if (rows.safetensors.codes && rows.safetensors.requantize) return RowReader::Requantized;
   if (rows.safetensors.codes) return RowReader::Safetensors;
   if (rows.ggufNvfp4RowBytes) return RowReader::GgufNvfp4;
   if (rows.safetensors.bfloat16) return RowReader::QuantizedBfloat16;
@@ -233,6 +234,47 @@ void quantizeRows(const gguf::TensorRows &rows, uint64_t start, uint64_t count, 
   }
 }
 
+// Native af4g64 bytes [column, column + span) of `count` rows of an affine
+// safetensors tensor of another type (SafetensorsSource::requantize) from
+// source row `start` on, back to back: each row's values decoded as its
+// format's gather decodes them (scale * code + bias of its group's bf16
+// scale and bias), rounded to bf16, and each group of 64 quantized as MLX's
+// affine quantization rounds it (quantizeGroup). One read of each tensor
+// per row.
+void requantizeRows(const gguf::TensorRows &rows, uint64_t start, uint64_t count, uint64_t column, uint64_t span,
+                    uint8_t *to) {
+  const QuantFormat &target = kQuantFormats[GGUF_FMT_AF4G64];
+  const uint32_t source = rows.safetensors.requantize, bits = (source >> 8) & 0xFF, group = source & 0xFF;
+  if (gguf_format_of(rows.type) != GGUF_FMT_AF4G64 || column % target.block_bytes || span % target.block_bytes ||
+      !bits || bits > 8 || !group)
+    throw GgufError("an affine tensor is quantized again into whole af4g64 groups: " + rows.name);
+  const uint64_t columns = rows.rowBytes / target.block_bytes * target.block_elements;
+  if (columns % group || columns * bits % 8) throw GgufError("invalid requantized rows: " + rows.name);
+  const uint64_t codeBytes = columns * bits / 8, groups = columns / group;
+  const uint64_t first = column / target.block_bytes * target.block_elements;
+  const uint64_t values = span / target.block_bytes * target.block_elements;
+  std::vector<uint8_t> codes(codeBytes + 1), scales(groups * 2), biases(groups * 2);
+  std::vector<uint8_t> weights(values * 2);
+  for (uint64_t row = 0; row < count; ++row) {
+    const uint64_t at = start + row;
+    rows.safetensors.codes->read(at * codeBytes, {codes.data(), codeBytes});
+    rows.safetensors.scales->read(at * groups * 2, scales);
+    rows.safetensors.biases->read(at * groups * 2, biases);
+    for (uint64_t i = 0; i < values; ++i) {
+      const uint64_t element = first + i, bit = element * bits;
+      const uint32_t pair = uint32_t(codes[bit / 8]) | uint32_t(codes[bit / 8 + 1]) << 8;
+      const uint32_t code = (pair >> (bit % 8)) & ((1u << bits) - 1);
+      uint16_t scale, bias;
+      std::memcpy(&scale, scales.data() + element / group * 2, 2);
+      std::memcpy(&bias, biases.data() + element / group * 2, 2);
+      const uint16_t value = nearestBfloat16(widenBfloat16(scale) * float(code) + widenBfloat16(bias));
+      std::memcpy(weights.data() + 2 * i, &value, 2);
+    }
+    for (uint64_t g = 0; g < values / target.block_elements; ++g)
+      quantizeGroup(weights.data() + g * target.block_elements * 2, to + row * span + g * target.block_bytes);
+  }
+}
+
 // The values of a block_q8_0.
 constexpr uint32_t kQ8_0BlockValues = kQuantFormats[GGUF_FMT_Q80].block_elements;
 
@@ -346,6 +388,7 @@ void readRows(const gguf::TensorRows &rows, uint64_t first, uint64_t count, uint
     switch (rowReader(rows)) {
     case RowReader::Stored: rows.file->readData(rows.offset + start * rows.rowBytes + column, {out, run * span}); break;
     case RowReader::Safetensors: readSafetensorsRows(rows, start, run, column, span, out); break;
+    case RowReader::Requantized: requantizeRows(rows, start, run, column, span, out); break;
     case RowReader::GgufNvfp4: readGgufNvfp4Rows(rows, start, run, column, span, out); break;
     case RowReader::QuantizedBfloat16: quantizeRows(rows, start, run, column, span, out); break;
     case RowReader::QuantizedGgufFloat: quantizeQ8_0Rows(rows, start, run, column, span, out); break;

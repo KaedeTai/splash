@@ -167,6 +167,29 @@ struct Qwen4ExpLayerWeights final {
   std::optional<Qwen4PleWeights> ple;
 };
 
+// The MTP head an MLX checkpoint embeds (mlx-vlm's Qwen4ExpMTPModule): from
+// the streams of a position and the embedding of the token after it, the
+// head's own streams, embeddingProjection(embeddingNorm(e)) added to
+// hiddenProjection of each stream of hiddenNorm(streams) (one RMS over all
+// streamWidth() values); then one hyper-connected full-attention layer with
+// a sparse MoE, whose output streams the next draft step reads, and its last
+// mix, which the target's head reads. Its draft attention attends a window
+// of its own keys and values (Qwen4ExpTarget's MTP state) without the QSA.
+struct Qwen4MtpWeights final {
+  ops::NormWeights embeddingNorm;
+  ops::NormWeights hiddenNorm;
+  ops::Projection embeddingProjection;
+  ops::Projection hiddenProjection;
+  Qwen4HyperWeights mixerHyper;
+  QwenAttentionWeights attention;
+  Qwen4HyperWeights ffnHyper;
+  ops::BlockMoeWeights ffn;
+  Qwen4HyperWeights finalHyper;
+  // The target's head in fewer bits, which the drafts read (an 8-bit head
+  // as af4g64): the draft only proposes the tokens the target's head picks.
+  ops::Projection head;
+};
+
 struct Qwen4ExpWeights final : QwenTargetWeightsBase {
   Qwen4ExpLayout layout;
   std::vector<Qwen4ExpLayerWeights> layers;
@@ -178,6 +201,8 @@ struct Qwen4ExpWeights final : QwenTargetWeightsBase {
   ops::EmbeddingWeights pleTable;
   uint32_t pleFormat = 0;
   Qwen4PleHash pleHash;
+  // The embedded MTP head, which loads from an MLX checkpoint that holds one.
+  std::optional<Qwen4MtpWeights> mtp;
 };
 
 [[nodiscard]] Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend, Qwen4ExpLayout layout,
