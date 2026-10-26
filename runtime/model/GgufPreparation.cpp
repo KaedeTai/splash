@@ -638,6 +638,10 @@ void writeDecoded(metal::MetalBackend &backend, const metal::MetalBuffer &image,
 
 } // namespace
 
+void readCopyRows(const gguf::TensorRows &rows, uint64_t first, uint64_t count, uint8_t *to) {
+  readRows(rows, first, count, 0, rows.rowBytes, to);
+}
+
 void readRepackRows(const gguf::Repack &repack, uint64_t first, uint64_t count, uint8_t *to) {
   uint64_t sourceRows = 0;
   for (const gguf::TensorRows &tensor : repack.sources) sourceRows += tensor.rows;

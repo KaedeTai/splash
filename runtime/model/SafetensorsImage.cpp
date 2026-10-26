@@ -209,7 +209,7 @@ public:
   // (one bf16 or F32 value), which the writer folds into an affine row's
   // scales and biases, as model/Qwen4Exp.cpp reads a GGUF's
   // per_layer_token_embd.
-  void pleTable(const std::string &table, const std::vector<PleShard> &shards, uint64_t columns) {
+  gguf::StreamedRows pleTable(const std::string &table, const std::vector<PleShard> &shards, uint64_t columns) {
     if (shards.empty()) throw WeightStoreError(table + " holds no row shards");
     std::vector<TensorRows> sources;
     uint64_t rows = 0;
@@ -230,11 +230,14 @@ public:
     const uint64_t rowBytes = sources.front().rowBytes;
     image_.descriptor(sources.front().type, rows, columns, {}, {rows * rowBytes, 0, 0}, table);
     uint64_t destination = image_.section(rows * rowBytes);
+    const uint32_t type = sources.front().type;
     for (TensorRows &source : sources) {
       const uint64_t bytes = source.rows * rowBytes;
       image_.copyAt(destination, std::move(source), Conversion::None);
       destination += bytes;
     }
+    if (rowBytes > UINT32_MAX) throw WeightStoreError(table + "'s rows are too wide to stream");
+    return {table, 0, 0, rows, static_cast<uint32_t>(rowBytes), gguf_format_of(type)};
   }
 
   // The token table's rows, which the embedding kernel gathers: native rows
@@ -611,9 +614,13 @@ std::vector<gguf::Image> planImages(const SafetensorsCheckpoint &checkpoint, con
   images.push_back(embedding.finish());
   if (geometry.hasPle()) {
     Builder table(checkpoint, geometry, names, "ple.bin", geometry.pleLayer, kTableImageType);
-    table.pleTable(pleEmbeddingModule(geometry, names) + "ngram_embedding", pleShards(checkpoint, geometry, names),
-                   geometry.pleHeadDimension);
-    images.push_back(table.finish());
+    const gguf::StreamedRows rows = table.pleTable(pleEmbeddingModule(geometry, names) + "ngram_embedding",
+                                                   pleShards(checkpoint, geometry, names), geometry.pleHeadDimension);
+    gguf::Image image = table.finish();
+    // Its rows stream from the shards instead (SafetensorsTargetLoader::streamTable),
+    // each read as the image would hold it.
+    if (options.streamTable) image.streamedRows = rows;
+    images.push_back(std::move(image));
   }
   if (hasMtp(checkpoint, geometry)) {
     // Its experts load with it whether the target's stream or not.

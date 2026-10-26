@@ -7,12 +7,15 @@
 
 #include "model/ExpertStore.hpp"
 #include "model/GgufImage.hpp"
+#include "model/GgufTarget.hpp"
+#include "model/SparseRowStore.hpp"
 #include "model/QwenHybridLayout.hpp"
 #include "model/SafetensorsCheckpoint.hpp"
 #include "model/WeightImages.hpp"
 
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace splash::model {
@@ -21,9 +24,13 @@ class SafetensorsTargetLoader final {
 public:
   // Plans every image of the checkpoint in directory once. With expert
   // memory (experts.memoryBytes), a MoE target's routed experts stream
-  // (streamedExperts()) instead of loading with their layers.
+  // (streamedExperts()) instead of loading with their layers. With a table
+  // store (table.cacheBytes), the rows of the table a family's checkpoint
+  // holds (Flash-Next's PLE n-gram table) stream from its shards through
+  // it (streamTable()) instead of loading (table()).
   SafetensorsTargetLoader(metal::MetalBackend &backend, WeightImages &images, const std::filesystem::path &directory,
-                          const QwenTargetDimensions &geometry, ExpertStoreOptions experts = {});
+                          const QwenTargetDimensions &geometry, ExpertStoreOptions experts = {},
+                          SparseRowStoreOptions table = {});
   SafetensorsTargetLoader(const SafetensorsTargetLoader &) = delete;
   SafetensorsTargetLoader &operator=(const SafetensorsTargetLoader &) = delete;
 
@@ -34,6 +41,9 @@ public:
   // (safetensors::planImages: Qwen3.8-Flash-Next's PLE n-gram table), which
   // loads with the weights; refused for a target without one.
   [[nodiscard]] WeightFile table();
+  // The streamed table, its store reading the checkpoint's shards; none when
+  // the table loads.
+  [[nodiscard]] std::optional<GgufTargetLoader::StreamedTable> streamTable() const;
   // The image of the MTP head the checkpoint embeds (safetensors::hasMtp),
   // which loads with the weights; refused for a target without one.
   [[nodiscard]] bool hasMtp() const noexcept { return planned_->mtp != 0; }
@@ -58,6 +68,7 @@ private:
     uint32_t layers = 0;
     // The index of the table's and the MTP head's images, 0 for none.
     size_t table = 0, mtp = 0;
+    SparseRowStoreOptions tableStore;
   };
   [[nodiscard]] WeightFile open(size_t index);
 

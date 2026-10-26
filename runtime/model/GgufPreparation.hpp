@@ -35,5 +35,10 @@ struct StoredRows final {
   uint64_t offset = 0;
 };
 [[nodiscard]] std::optional<StoredRows> storedRepackRows(const gguf::Repack &repack, uint64_t first, uint64_t count);
+// Rows [first, first + count) of a copy's source as the image holds them
+// when copied as stored (Conversion::None), whole and back to back into
+// `to`: a streamed table's rows of an MLX checkpoint's shards, from any
+// thread.
+void readCopyRows(const gguf::TensorRows &rows, uint64_t first, uint64_t count, uint8_t *to);
 
 } // namespace splash::model
