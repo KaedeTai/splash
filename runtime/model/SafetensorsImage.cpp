@@ -131,6 +131,20 @@ public:
     floatRows(module, rows, columns, image_.section(bytes));
   }
 
+  // The MoE router [experts, hidden]: as floatTensor, but a hyper-connected
+  // target's unquantized BF16 router keeps its BF16 rows as stored, as a
+  // GGUF's does (GgufImage.cpp floatTensor): the float projection reads them
+  // as it reads their F32 values, in half the bytes (Flash-Next's router of
+  // 512 experts is 5 MiB a layer in F32, which every decode step reads).
+  void router(const std::string &module, uint64_t rows, uint64_t columns) {
+    const SourceTensor *weight = checkpoint_.find(module + ".weight");
+    if (!geometry_.hyperConnected() || checkpoint_.find(module + ".scales") || !weight || weight->dtype != "BF16")
+      return floatTensor(module, rows, columns);
+    const SourceTensor &table = require(module + ".weight", {"BF16"}, {rows, columns});
+    image_.descriptor(ggml::kBF16, rows, columns, {}, {table.bytes, 0, 0}, module);
+    image_.copy(this->rows(module + ".weight", table, ggml::kBF16, rows, table.bytes / rows));
+  }
+
   // Rows [first, first + rows) of a [total, columns] module as an F32
   // tensor: the QSA indexer's query and key projections, which MLX keeps as
   // one module (index_qk_proj, the query's rows then the key's) and the
@@ -400,6 +414,7 @@ struct QuantizedModules {
   }
   void alphaBeta(const std::string &, const std::string &) {}
   void floatTensor(const std::string &, uint64_t, uint64_t) {}
+  void router(const std::string &, uint64_t, uint64_t) {}
   void floatSlice(const std::string &, uint64_t, uint64_t, uint64_t, uint64_t) {}
   void floatValues(const std::string &, uint64_t, uint64_t) {}
   void widened(const std::string &, const std::vector<uint64_t> &) {}
@@ -442,7 +457,7 @@ template <class Walk> void walkFfn(Walk &b, const QwenTargetDimensions &g, const
   const std::string mlp = prefix + "mlp.";
   if (g.ffnKind == QwenFfnKind::SparseMoe) {
     const uint64_t width = g.expertIntermediateSize;
-    b.floatTensor(mlp + "gate", g.experts, g.hiddenSize);
+    b.router(mlp + "gate", g.experts, g.hiddenSize);
     b.experts(mlp, "gate_proj", width, g.hiddenSize);
     b.experts(mlp, "up_proj", width, g.hiddenSize);
     b.experts(mlp, "down_proj", g.hiddenSize, width);
